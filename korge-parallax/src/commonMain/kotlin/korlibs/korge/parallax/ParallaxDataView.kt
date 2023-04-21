@@ -1,9 +1,8 @@
 package korlibs.korge.parallax
 
 import korlibs.datastructure.ExtraTypeCreate
-import korlibs.datastructure.iterators.fastForEach
+import korlibs.datastructure.iterators.fastForEachWithIndex
 import korlibs.datastructure.setExtra
-import korlibs.memory.clamp
 import korlibs.korge.view.*
 import korlibs.korge.view.animation.*
 import korlibs.image.atlas.MutableAtlas
@@ -11,15 +10,18 @@ import korlibs.image.format.*
 import korlibs.io.file.VfsFile
 import korlibs.io.file.baseName
 import korlibs.math.geom.SizeInt
+import korlibs.time.TimeSpan
 
 inline fun Container.parallaxDataView(
     data: ParallaxDataContainer,
-    scale: Double = 1.0,
+    scale: Float = 1.0f,
     smoothing: Boolean = false,
-    disableScrollingX: Boolean = false,
-    disableScrollingY: Boolean = false,
     callback: @ViewDslMarker ParallaxDataView.() -> Unit = {}
-): ParallaxDataView = ParallaxDataView(data, scale, smoothing, disableScrollingX, disableScrollingY).addTo(this, callback)
+): ParallaxDataView = ParallaxDataView(data, scale, smoothing).addTo(this, callback)
+
+interface KorgeViewBase {
+    fun getLayer(name: String) : View?
+}
 
 /**
  * The ParallaxDataView is a special view object which can be used to show some background layers behind the play
@@ -73,34 +75,34 @@ inline fun Container.parallaxDataView(
  */
 class ParallaxDataView(
     data: ParallaxDataContainer,
-    scale: Double = 1.0,
+    scale: Float = 1.0f,
     smoothing: Boolean = false,
-    disableScrollingX: Boolean = false,
-    disableScrollingY: Boolean = false
-) : Container() {
+) : Container(), KorgeViewBase {
 
     // Delta movement in X or Y direction of the parallax background depending on the scrolling direction
-    var deltaX: Double = 0.0
-    var deltaY: Double = 0.0
+    var deltaX: Float = 0.0f
+    var deltaY: Float = 0.0f
 
     // Percentage of the position diagonally to the scrolling direction (only used with parallax plane setup)
-    var diagonal: Double = 0.0  // Range: [0...1]
+    var diagonal: Float = 0.0f  // Range: [0...1]
 
     // Accessing properties of layer objects
     private val layerMap: HashMap<String, View> = HashMap()
 
     // The middle point of the parallax plane (central vanishing point on the screen)
-    private val parallaxPlaneMiddlePoint: Double =
+    private val parallaxPlaneMiddlePoint: Float =
         when (data.config.mode) {
-            ParallaxConfig.Mode.HORIZONTAL_PLANE -> data.config.size.width * 0.5
-            ParallaxConfig.Mode.VERTICAL_PLANE -> data.config.size.height * 0.5
-            ParallaxConfig.Mode.NO_PLANE -> 0.0  // not used without parallax plane setup
+            ParallaxConfig.Mode.HORIZONTAL_PLANE -> (data.config.parallaxPlane?.size?.width?.toFloat() ?: 0f) * 0.5f
+            ParallaxConfig.Mode.VERTICAL_PLANE -> (data.config.parallaxPlane?.size?.height?.toFloat() ?: 0f) * 0.5f
+            ParallaxConfig.Mode.NO_PLANE -> 0.0f  // not used without parallax plane setup
         }
 
-    private val parallaxLayerSize =
+    val parallaxLayerSize: Int =
         when (data.config.mode) {
-            ParallaxConfig.Mode.HORIZONTAL_PLANE -> data.backgroundLayers?.height ?: data.foregroundLayers?.height?: data.attachedLayers?.height ?: 0
-            ParallaxConfig.Mode.VERTICAL_PLANE -> data.backgroundLayers?.width ?: data.foregroundLayers?.width ?: data.attachedLayers?.width ?: 0
+            ParallaxConfig.Mode.HORIZONTAL_PLANE ->
+                (data.backgroundLayers?.height ?: data.foregroundLayers?.height?: data.attachedLayersFront?.height ?: data.attachedLayersRear?.height ?: 0) - (data.config.parallaxPlane?.offset ?: 0)
+            ParallaxConfig.Mode.VERTICAL_PLANE ->
+                (data.backgroundLayers?.width ?: data.foregroundLayers?.width ?: data.attachedLayersFront?.width ?: data.attachedLayersRear?.height ?: 0) - (data.config.parallaxPlane?.offset ?: 0)
             ParallaxConfig.Mode.NO_PLANE -> 0  // not used without parallax plane setup
         }
 
@@ -108,89 +110,79 @@ class ParallaxDataView(
     // The array will contain numbers starting from 1.0 -> 0.0 and then from 0.0 -> 1.0
     // The first part of the array is used as speed factor for the upper / left side of the parallax plane.
     // The second part is used for the lower / right side of the parallax plane.
-    private val parallaxPlaneSpeedFactor = DoubleArray(
+    val parallaxPlaneSpeedFactor = FloatArray(
         parallaxLayerSize
     ) { i ->
-        val midPoint: Double = parallaxLayerSize * 0.5
-        (data.config.parallaxPlane?.speed ?: 1.0) * (
+        val midPoint: Float = parallaxLayerSize * 0.5f
+        (data.config.parallaxPlane?.speedFactor ?: 1.0f) * (
             // The pixel in the point of view must not stand still, they need to move with the lowest possible speed (= 1 / midpoint)
             // Otherwise the midpoint is "running" away over time
             if (i < midPoint)
-                1 - (i / midPoint)
+                1f - (i / midPoint)
             else
-                (i - midPoint + 1) / midPoint
+                (i - midPoint + 1f) / midPoint
             )
     }
 
-    fun getLayer(name: String): View? {
-        return layerMap[name]
-    }
+    val parallaxLines: Array<View?> = Array(parallaxLayerSize) { null }
+
+    override fun getLayer(name: String): View? = layerMap[name]
 
     private fun constructParallaxPlane(
         parallaxPlane: ImageDataContainer?,
-        attachedLayers: ImageData?,
+        attachedLayersFront: ImageData?,
+        attachedLayersRear: ImageData?,
         config: ParallaxPlaneConfig?,
         isScrollingHorizontally: Boolean,
-        smoothing: Boolean,
-        disableScrollingX: Boolean,
-        disableScrollingY: Boolean
+        smoothing: Boolean
     ) {
         if (parallaxPlane == null || config == null) return
         if (parallaxPlane.imageDatas[0].frames.isEmpty()) error("Parallax plane not found. Check that name of parallax plane layer in Aseprite matches the name in the parallax config.")
         if (parallaxPlaneSpeedFactor.size < parallaxPlane.imageDatas.size) error("Parallax data must at least contain one layer in backgroundLayers, foregroundLayers or attachedLayers!")
 
+        // Add attached layers which will be below parallax plane
+        if (attachedLayersRear != null && config.attachedLayersRear != null) {
+            constructAttachedLayers(attachedLayersRear, config.attachedLayersRear, smoothing, isScrollingHorizontally)
+        }
+
         layerMap[config.name] = container {
-            parallaxPlane.imageDatas.fastForEach { data ->
+            parallaxPlane.imageDatas.fastForEachWithIndex { i, data ->
+
                 imageDataViewEx(data, playing = false, smoothing = smoothing, repeating = true) {
                     val layer = getLayer(config.name)
                     if (layer == null) {
-                        error("Could not find parallax plane '${config.name}' in ImageData. Check that name of parallax plane in Aseprite matches the name in the parallax config.")
-                    } else layer as SingleTile
-                    if (isScrollingHorizontally) {
-                        layer.repeat(repeatX = true)
-                        x = parallaxPlaneMiddlePoint.toFloat()
-                        val speedFactor = parallaxPlaneSpeedFactor[layer.y.toInt()]
-                        // Calculate the offset for the inner scrolling of the layer depending of its y-position
-                        if (!disableScrollingX) addUpdater { x += (((deltaX * speedFactor) + (config.selfSpeed * speedFactor)) * it.milliseconds).toFloat() }
-                    } else {
-                        layer.repeat(repeatY = true)
-                        y = parallaxPlaneMiddlePoint.toFloat()
-                        val speedFactor = parallaxPlaneSpeedFactor[layer.x.toInt()]
-                        // Calculate the offset for the inner scrolling of the layer depending of its x-position
-                        if (!disableScrollingY) addUpdater { y += (((deltaY * speedFactor) + (config.selfSpeed * speedFactor)) * it.milliseconds).toFloat() }
+                        println("WARNING: Could not find parallax plane '${config.name}' in ImageData. Check that name of parallax plane in Aseprite matches the name in the parallax config.")
+                    } else parallaxLines[i] = (layer as SingleTile).apply {
+                        if (isScrollingHorizontally) {
+                            layer.repeat(repeatX = true)
+                            x = parallaxPlaneMiddlePoint
+                        } else {
+                            layer.repeat(repeatY = true)
+                            y = parallaxPlaneMiddlePoint
+                        }
                     }
                 }
+
             }
         }
 
-        if (attachedLayers != null && config.attachedLayers != null) {
-            if (attachedLayers.frames.isEmpty()) error("No attached layers not found. Check that name of attached layers in Aseprite matches the name in the parallax config.")
+        // Add attached layers which will be on top of parallax plane
+        if (attachedLayersFront != null && config.attachedLayersFront != null) {
+            constructAttachedLayers(attachedLayersFront, config.attachedLayersFront, smoothing, isScrollingHorizontally)
+        }
+    }
 
-            val imageData = imageDataViewEx(attachedLayers, playing = false, smoothing = smoothing, repeating = true)
+    private fun constructAttachedLayers(attachedLayers: ImageData, attachedLayersConfig: List<ParallaxAttachedLayerConfig>, smoothing: Boolean, isScrollingHorizontally: Boolean) {
+        if (attachedLayers.frames.isEmpty()) error("No attached layers not found. Check that name of attached layers in Aseprite matches the name in the parallax config.")
+        val imageData = imageDataViewEx(attachedLayers, playing = false, smoothing = smoothing, repeating = true)
 
-            for (conf in config.attachedLayers) {
-                val layer = imageData.getLayer(conf.name)
-                    ?: error("Could not find layer '${config.name}' in ImageData. Check that name of attached layer in Aseprite matches the name in the parallax config.")
+        for (conf in attachedLayersConfig) {
+            val layer = imageData.getLayer(conf.name)
 
-                layerMap[conf.name] = (layer as SingleTile).apply {
-                    repeat(repeatX = isScrollingHorizontally && conf.repeat, repeatY = !isScrollingHorizontally && conf.repeat)
-
-                    if (!disableScrollingX && isScrollingHorizontally) {
-                        // Attach the layer to the position on the parallax plane (either top or bottom border
-                        // depending on attachBottomRight config)
-                        val speedFactor =parallaxPlaneSpeedFactor[layer.y.toInt() + (layer.height.toInt().takeIf { conf.attachBottomRight } ?: 0)]
-                        addUpdater {
-                            // Calculate the offset for the inner scrolling of the layer
-                            x += (((deltaX * speedFactor) + (config.selfSpeed * speedFactor)) * it.milliseconds).toFloat()
-                        }
-                    } else if (!disableScrollingY && !isScrollingHorizontally) {
-                        val speedFactor = parallaxPlaneSpeedFactor[layer.x.toInt() + (layer.width.toInt().takeIf { conf.attachBottomRight } ?: 0)]
-                        addUpdater {
-                            // Calculate the offset for the inner scrolling of the layer
-                            x += (((deltaY * speedFactor) + (config.selfSpeed * speedFactor)) * it.milliseconds).toFloat()
-                        }
-                    }
-                }
+            if (layer == null) {
+                println("WARNING: Could not find layer '${conf.name}' in ImageData. Check that name of attached layer in Aseprite matches the name in the parallax config.")
+            } else layerMap[conf.name] = (layer as SingleTile).apply {
+                repeat(repeatX = isScrollingHorizontally && conf.repeat, repeatY = !isScrollingHorizontally && conf.repeat)
             }
         }
     }
@@ -198,90 +190,75 @@ class ParallaxDataView(
     private fun constructLayer(
         layers: ImageData?,
         config: List<ParallaxLayerConfig>?,
-        mode: ParallaxConfig.Mode,
         smoothing: Boolean,
-        disableScrollingX: Boolean,
-        disableScrollingY: Boolean
     ) {
         if (layers == null || config == null || layers.frames.isEmpty()) return
-
         val imageData = imageDataViewEx(layers, playing = false, smoothing = smoothing, repeating = true)
 
         for (conf in config) {
             val layer = imageData.getLayer(conf.name)
-                ?: error("Could not find layer '${conf.name}' in ImageData. Check that name of layer in Aseprite matches the name in the parallax config.")
 
-            layerMap[conf.name] = (layer as SingleTile).apply {
+            if (layer == null) {
+                println("Could not find layer '${conf.name}' in ImageData. Check that name of layer in Aseprite matches the name in the parallax config.")
+            } else layerMap[conf.name] = (layer as SingleTile).apply {
                 repeat(repeatX = conf.repeatX, repeatY = conf.repeatY)
-
-                if (!(conf.speedX.isNaN() && conf.speedY.isNaN() && conf.selfSpeedX.isNaN() && conf.selfSpeedY.isNaN())) {
-                    // Prevent that one number is possibly NaN
-                    val speedX = if (conf.speedX.isNaN()) 0.0 else conf.speedX
-                    val speedY = if (conf.speedY.isNaN()) 0.0 else conf.speedY
-                    val selfSpeedX = if (conf.selfSpeedX.isNaN()) 0.0 else conf.selfSpeedX
-                    val selfSpeedY = if (conf.selfSpeedY.isNaN()) 0.0 else conf.selfSpeedY
-
-                    // Do horizontal or vertical movement depending on parallax scrolling direction
-                    // Calculate the offset for the inner scrolling of the layer
-                    when (mode) {
-                        ParallaxConfig.Mode.HORIZONTAL_PLANE -> {
-                            if (!disableScrollingX) { addUpdater { x += ((deltaX * speedX + selfSpeedX) * it.milliseconds).toFloat() } }
-                        }
-                        ParallaxConfig.Mode.VERTICAL_PLANE -> {
-                            if (!disableScrollingY) { addUpdater { y += ((deltaY * speedY + selfSpeedY) * it.milliseconds).toFloat() } }
-                        }
-                        ParallaxConfig.Mode.NO_PLANE -> {
-                            if (!disableScrollingX && !disableScrollingY) {
-                                addUpdater {
-                                    x += ((deltaX * speedX + selfSpeedX) * it.milliseconds).toFloat()
-                                    y += ((deltaY * speedY + selfSpeedY) * it.milliseconds).toFloat()
-                                }
-                            }
-                            if (!disableScrollingX && disableScrollingY) { addUpdater { x += ((deltaX * speedX + selfSpeedX) * it.milliseconds).toFloat() } }
-                            if (disableScrollingX && !disableScrollingY) { addUpdater { y += ((deltaY * speedY + selfSpeedY) * it.milliseconds).toFloat() } }
-                        }
-                    }
-                }
             }
         }
     }
 
+    fun update(time: TimeSpan) {
+// Maybe too expensive if no animation is played
+// Better call update of layer separately if it has an animation to play
+//        layerMap.forEach {
+//            when (val view = it.value) {
+//                is ImageAnimView -> view.update(time)
+//                is Container -> view.children.forEach { line ->
+//                    line as ImageAnimView
+//                    line.update(time) }
+//            }
+//        }
+    }
+
     init {
         // Only the base container for all view objects needs to be scaled
-        this.scaleAvg = scale.toFloat()
+        this.scaleAvg = scale
 
         // First create background layers in the back
-        constructLayer(data.backgroundLayers, data.config.backgroundLayers, data.config.mode, smoothing, disableScrollingX, disableScrollingY)
+        constructLayer(data.backgroundLayers, data.config.backgroundLayers, smoothing)
 
         // Then construct the two parallax planes with their attached layers
         if (data.config.mode != ParallaxConfig.Mode.NO_PLANE) {
             constructParallaxPlane(
                 data.parallaxPlane,
-                data.attachedLayers,
+                data.attachedLayersFront,
+                data.attachedLayersRear,
                 data.config.parallaxPlane,
                 data.config.mode == ParallaxConfig.Mode.HORIZONTAL_PLANE,
-                smoothing,
-                disableScrollingX,
-                disableScrollingY
+                smoothing
             )
-            // Do horizontal or vertical movement depending on parallax scrolling direction
-            if (!disableScrollingY && data.config.mode == ParallaxConfig.Mode.HORIZONTAL_PLANE) {
-                // Move parallax plane inside borders
-                addUpdater {
-                    // Sanity check of diagonal movement - it has to be between 0.0 and 1.0
-                    diagonal = diagonal.clamp(0.0, 1.0)
-                    y = (-(diagonal * (parallaxLayerSize - data.config.size.height))).toFloat()
-                }
-            } else if (!disableScrollingX && data.config.mode == ParallaxConfig.Mode.VERTICAL_PLANE) {
-                addUpdater {
-                    diagonal = diagonal.clamp(0.0, 1.0)
-                    x = (-(diagonal * (parallaxLayerSize - data.config.size.width))).toFloat()
-                }
-            }
+
+// TODO move this into PositionSystem
+//            val parallaxSize = parallaxLayerSize - (data.config.parallaxPlane?.offset ?: 0)
+//            // Do horizontal or vertical movement depending on parallax scrolling direction
+//            if (!disableScrollingY && data.config.mode == ParallaxConfig.Mode.HORIZONTAL_PLANE) {
+//                val height = data.config.parallaxPlane?.size?.height?.toFloat() ?: 0.0
+//                // Move parallax plane inside borders
+//                addUpdater {
+//                    // Sanity check of diagonal movement - it has to be between 0.0 and 1.0
+//                    diagonal = diagonal.clamp(0.0, 1.0)
+//                    y = -(diagonal * (parallaxLayerSize - height))
+//                }
+//            } else if (!disableScrollingX && data.config.mode == ParallaxConfig.Mode.VERTICAL_PLANE) {
+//                val width = data.config.parallaxPlane?.size?.width?.toFloat() ?: 0.0
+//                addUpdater {
+//                    diagonal = diagonal.clamp(0.0, 1.0)
+//                    x = -(diagonal * (parallaxLayerSize - width))
+//                }
+//            }
         }
 
         // Last construct the foreground layers on top
-        constructLayer(data.foregroundLayers, data.config.foregroundLayers, data.config.mode, smoothing, disableScrollingX, disableScrollingY)
+        constructLayer(data.foregroundLayers, data.config.foregroundLayers, smoothing)
     }
 }
 
@@ -305,8 +282,14 @@ suspend fun VfsFile.readParallaxDataContainer(
             val out = format.readImage(this.readAsSyncStream(), props)
             if (atlas != null) out.packInMutableAtlas(atlas) else out
         } else null,
-        attachedLayers = if (config.parallaxPlane?.attachedLayers != null) {
-            props.setExtra("layers", config.parallaxPlane.attachedLayers.joinToString(separator = ",") { it.name })
+        attachedLayersFront = if (config.parallaxPlane?.attachedLayersFront != null) {
+            props.setExtra("layers", config.parallaxPlane.attachedLayersFront.joinToString(separator = ",") { it.name })
+            props.setExtra("disableSlicing", true)
+            val out = format.readImage(this.readAsSyncStream(), props)
+            if (atlas != null) out.packInMutableAtlas(atlas) else out
+        } else null,
+        attachedLayersRear = if (config.parallaxPlane?.attachedLayersRear != null) {
+            props.setExtra("layers", config.parallaxPlane.attachedLayersRear.joinToString(separator = ",") { it.name })
             props.setExtra("disableSlicing", true)
             val out = format.readImage(this.readAsSyncStream(), props)
             if (atlas != null) out.packInMutableAtlas(atlas) else out
@@ -326,7 +309,7 @@ suspend fun VfsFile.readParallaxDataContainer(
  * It stores the [ParallaxConfig] and all [ImageData] objects for the background, foreground and attached Layers. The
  * parallax plane is a sliced Aseprite image and therefore consists of a [ImageDataContainer] object.
  *
- * All these image data objects are read from one Aseprite file. Function [readParallaxDataContainerFromAseFile]
+ * All these image data objects are read from one Aseprite file. Function [readParallaxDataContainer]
  * uses special [ImageDecodingProps] to control which details of the Aseprite file are read into which image
  * data object.
  */
@@ -334,13 +317,13 @@ data class ParallaxDataContainer(
     val config: ParallaxConfig,
     val backgroundLayers: ImageData?,
     val foregroundLayers: ImageData?,
-    val attachedLayers: ImageData?,
+    val attachedLayersFront: ImageData?,
+    val attachedLayersRear: ImageData?,
     val parallaxPlane: ImageDataContainer?
 )
 
 /**
- * This is the main parallax configuration. It contains the virtual [size] of the parallax background which describes
- * the resolution in pixels which is displayed on the screen.
+ * This is the main parallax configuration.
  * The [aseName] is the name of the aseprite file which is used for reading the image data.
  * (Currently it is not used. It will be used when reading the config from YAML/JSON file.)
  *
@@ -363,8 +346,7 @@ data class ParallaxDataContainer(
  * layers. Please look at [ParallaxLayerConfig] and [ParallaxPlaneConfig] data classes for more details.
  */
 data class ParallaxConfig(
-    val size: SizeInt,
-    val aseName: String = "",
+    val aseName: String,
     val mode: Mode = Mode.HORIZONTAL_PLANE,
     val backgroundLayers: List<ParallaxLayerConfig>? = null,
     val parallaxPlane: ParallaxPlaneConfig? = null,
@@ -382,20 +364,28 @@ data class ParallaxConfig(
  * The top part is the upper half of the Aseprite image. The bottom part is the bottom part. This is used to simulate
  * a central vanishing point in the resulting parallax effect.
  *
+ * [size] contains the virtual size of the parallax background which describes the resolution in pixels which is
+ * displayed on the screen.
+ * [offset] TODO add description
+ *
  * [name] has to be set to the name of the layer in the Aseprite which contains the image for the sliced stripes
  * of the parallax plane.
  * [speed] is the factor for scrolling the parallax plane relative to the game play field (which usually contains the
  * level map).
  * [selfSpeed] is the factor for scrolling the parallax plane continuously in a direction independently of the player
  * input.
- * [attachedLayers] contain the config for further layers which are "attached" to the parallax plane. These layers
- * will scroll depending on their positions on the parallay plane.
+ * [attachedLayersFront] contains the config for further layers which are "attached" on top of the parallax plane.
+ * [attachedLayersRear] contains the config for further layers which are "attached" below the parallax plane.
+ * Both attached layer types will scroll depending on their position on the parallax plane.
  */
 data class ParallaxPlaneConfig(
+    val size: SizeInt,
+    val offset: Int = 0,
     val name: String,
-    val speed: Double = 1.0,
-    val selfSpeed: Double = 0.0,
-    val attachedLayers: List<ParallaxAttachedLayerConfig>? = null
+    val speedFactor: Float = 1.0f,
+    val selfSpeed: Float = 0.0f,
+    val attachedLayersFront: List<ParallaxAttachedLayerConfig>? = null,
+    val attachedLayersRear: List<ParallaxAttachedLayerConfig>? = null
 )
 
 /**
@@ -421,13 +411,13 @@ data class ParallaxAttachedLayerConfig(
 
 /**
  * This is the configuration for an independent parallax layer. Independent means that these layers are not attached
- * to the parallax plane. Their speed in X and Y direction can be configured independently by [speedX] and [speedY].
+ * to the parallax plane. Their speed in X and Y direction can be configured independently by [speedFactorX] and [speedFactorY].
  * Also, their self-Speed [selfSpeedX] and [selfSpeedY] can be configured independently.
  *
  * [name] has to be set to the name of the layer in the used Aseprite file. The image on this layer will be taken for
  * the layer object.
  * [repeatX] and [repeatY] describes if the image of the layer object should be repeated in X and Y direction.
- * [speedX] and [speedY] are the factors for scrolling the parallax layer in X and Y direction relative to the game
+ * [speedFactor] is the factors for scrolling the parallax layer in X and Y direction relative to the game
  * play field.
  * [selfSpeedX] and [selfSpeedY] are the factors for scrolling the parallax layer in X and Y direction continuously
  * and independently of the player input.
@@ -436,8 +426,7 @@ data class ParallaxLayerConfig(
     val name: String,
     val repeatX: Boolean = false,
     val repeatY: Boolean = false,
-    val speedX: Double = Double.NaN,
-    val speedY: Double = Double.NaN,
-    val selfSpeedX: Double = Double.NaN,
-    val selfSpeedY: Double = Double.NaN
+    val speedFactor: Float? = null,  // It this is null than no movement is applied to the layer
+    val selfSpeedX: Float = 0.0f,
+    val selfSpeedY: Float = 0.0f
 )

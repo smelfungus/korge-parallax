@@ -1,11 +1,12 @@
 package korlibs.korge.parallax
 
+import korlibs.image.format.ImageAnimation
 import korlibs.korge.view.Container
 import korlibs.korge.view.View
 import korlibs.korge.view.ViewDslMarker
 import korlibs.korge.view.addTo
-import korlibs.korge.view.animation.*
 import korlibs.image.format.ImageData
+import korlibs.time.TimeSpan
 
 /**
  * With imageDataView it is possible to display an image inside a Container or View.
@@ -60,11 +61,17 @@ open class ImageDataViewEx(
     smoothing: Boolean = true,
     repeating: Boolean = false
 ) : Container() {
-    private val animationView = if (repeating) repeatedImageAnimationView() else imageAnimationView()
+    private val animationView: ImageAnimationView<*> = if (repeating) repeatedImageAnimationView() else imageAnimationView()
 
     fun getLayer(name: String): View? {
         return animationView.getLayer(name)
     }
+
+    var currentFrameIndex: Int = 0
+        private set
+        get() = animationView.currentFrameIndex
+
+    var onPlayFinished: (() -> Unit)? = null
 
     var smoothing: Boolean = true
         set(value) {
@@ -96,11 +103,19 @@ open class ImageDataViewEx(
         updatedDataAnimation()
         if (playing) play() else stop()
         this.smoothing = smoothing
+        animationView.onPlayFinished = { onPlayFinished?.invoke() }
     }
 
-    fun play() { animationView.play() }
+    fun play(reverse : Boolean = false, once: Boolean = false) {
+        animationView.direction = if (!reverse && !once) ImageAnimation.Direction.FORWARD
+        else if (!reverse && once) ImageAnimation.Direction.ONCE_FORWARD
+        else if (reverse && !once) ImageAnimation.Direction.REVERSE
+        else ImageAnimation.Direction.ONCE_REVERSE
+        animationView.play()
+    }
     fun stop() { animationView.stop() }
     fun rewind() { animationView.rewind() }
+    fun update(time: TimeSpan) { animationView.update(time)}
 
     private fun updatedDataAnimation() {
         animationView.animation = if (animation != null) data?.animationsByName?.get(animation) else data?.defaultAnimation
