@@ -13,6 +13,7 @@ import korlibs.image.bitmap.*
 import korlibs.image.tiles.*
 import korlibs.image.tiles.TileSet
 import korlibs.math.geom.*
+import korlibs.math.geom.collider.HitTestDirection
 import kotlin.math.*
 
 inline fun Container.tileMap(
